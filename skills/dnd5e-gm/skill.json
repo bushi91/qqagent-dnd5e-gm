@@ -1,0 +1,41 @@
+{
+  "name": "D&D 5e 跑团主持",
+  "description": "在群里当 D&D 5e 的 DM：建角色卡、掷骰、检定、战斗回合、场景摘要。所有随机数与血量由代码计算，机器人只负责叙述；存档按会话保存在 data/dnd。",
+  "version": "1.0.0",
+  "author": "local",
+  "entry": "index.js",
+  "always": false,
+  "order": 12,
+  "allowedTools": ["send_message"],
+  "config": {
+    "title": "D&D 5e 跑团",
+    "hint": "开团后所有骰子、HP、先攻都由插件计算，机器人只叙述。玩家说「看团况」可随时查状态；说「开个团」即进入跑团模式。",
+    "schema": {
+      "enabled": { "type": "boolean", "title": "启用跑团技能", "default": true },
+      "maxParty": {
+        "type": "number",
+        "title": "队伍人数上限",
+        "description": "超过这个人数会提醒玩家精简队伍",
+        "default": 6,
+        "min": 1,
+        "max": 12,
+        "step": 1
+      },
+      "publicRolls": {
+        "type": "boolean",
+        "title": "公开骰",
+        "description": "关掉后所有骰子都只回给模型、不发到群里",
+        "default": true
+      },
+      "maxLog": {
+        "type": "number",
+        "title": "保留日志条数",
+        "description": "判定日志最多保留多少条，超出后从头截断",
+        "default": 200,
+        "min": 20,
+        "max": 1000,
+        "step": 10
+      }
+    }
+  }
+}
