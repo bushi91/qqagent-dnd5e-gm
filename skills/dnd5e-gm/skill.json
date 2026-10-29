@@ -1,15 +1,21 @@
 {
   "name": "D&D 5e 跑团主持",
-  "description": "在群里当 D&D 5e 的 DM：建角色卡、掷骰、检定、战斗回合、场景摘要。所有随机数与血量由代码计算，机器人只负责叙述；存档按会话保存在 data/dnd。",
-  "version": "1.0.0",
+  "description": "在群里当 D&D 5e 的 DM：建卡、确认角色卡、定目标、掷骰、检定、战斗回合、地形与移动、攻击结算扣血、行动经济，并能查种族/职业（含 1~12 级路线与 40 个子职业）/技能/天赋表。所有随机数、血量、距离由代码计算，机器人只负责叙述；存档按会话保存在 data/dnd。",
+  "version": "1.4.0",
   "author": "local",
   "entry": "index.js",
   "always": false,
   "order": 12,
   "allowedTools": ["send_message"],
+  "tools": [
+    "dnd_new", "dnd_sheet", "dnd_ready", "dnd_start", "dnd_objective",
+    "dnd_roll", "dnd_check", "dnd_combat", "dnd_attack", "dnd_damage",
+    "dnd_heal", "dnd_move", "dnd_map", "dnd_action", "dnd_state",
+    "dnd_log", "dnd_scene", "dnd_lookup"
+  ],
   "config": {
     "title": "D&D 5e 跑团",
-    "hint": "开团后所有骰子、HP、先攻都由插件计算，机器人只叙述。玩家说「看团况」可随时查状态；说「开个团」即进入跑团模式。",
+    "hint": "开团后所有骰子、HP、先攻、距离都由插件计算，机器人只叙述。固定流程：建卡 → 全员确认（dnd_ready）→ 开场定目标（dnd_start）→ 跑。战斗中攻击必须走 dnd_attack，挪位置走 dnd_move，其他动作走 dnd_action。",
     "schema": {
       "enabled": { "type": "boolean", "title": "启用跑团技能", "default": true },
       "maxParty": {
