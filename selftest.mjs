@@ -37,8 +37,8 @@ const api = {
 };
 skill.setup(api);
 
-ok(tools.size === 10, `注册了 ${tools.size} 个工具`);
-for (const id of ['dnd_new', 'dnd_state', 'dnd_sheet', 'dnd_roll', 'dnd_check', 'dnd_damage', 'dnd_heal', 'dnd_combat', 'dnd_scene', 'dnd_log']) {
+ok(tools.size === 18, `注册了 ${tools.size} 个工具`);
+for (const id of ['dnd_new', 'dnd_state', 'dnd_sheet', 'dnd_roll', 'dnd_check', 'dnd_damage', 'dnd_heal', 'dnd_combat', 'dnd_scene', 'dnd_log', 'dnd_attack', 'dnd_move', 'dnd_map', 'dnd_action', 'dnd_ready', 'dnd_start', 'dnd_objective', 'dnd_lookup']) {
   ok(tools.has(id), `有 ${id}`);
 }
 
@@ -52,9 +52,33 @@ const call = async (id, args) => {
   return res;
 };
 
+console.log('— lookup —');
+let res = await call('dnd_lookup', { kind: '种族', query: '精灵' });
+ok(!res.isError && res.content.includes('黑暗视觉'), '查种族（精灵）');
+res = await call('dnd_lookup', { kind: 'class', query: '法师' });
+ok(!res.isError && res.content.includes('生命骰'), '查职业（法师）');
+res = await call('dnd_lookup', { kind: '技能', query: '察觉' });
+ok(!res.isError && res.content.includes('感知'), '查技能（察觉）');
+res = await call('dnd_lookup', { kind: '天赋', query: '巨武器大师' });
+ok(!res.isError && res.content.includes('重武器'), '查天赋（巨武器大师）');
+res = await call('dnd_lookup', { kind: '种族' });
+ok(!res.isError && res.content.includes('矮人'), '不带名字列清单');
+res = await call('dnd_lookup', { kind: 'class', query: '战士' });
+ok(!res.isError && res.content.includes('12 级') && res.content.includes('不屈'), '职业路线到 12 级（战士）');
+res = await call('dnd_lookup', { kind: 'class', query: '战士 5 级' });
+ok(!res.isError && res.content.includes('额外攻击'), '查某一级（战士 5 级）');
+res = await call('dnd_lookup', { kind: 'class', query: '法师' });
+ok((res.content.match(/^\d+ 级：/gm) || []).length === 12, '每个职业 12 行路线');
+res = await call('dnd_lookup', { kind: 'class', query: '狂战士' });
+ok(!res.isError && res.content.includes('狂怒') && res.content.includes('野蛮人'), '子职业（狂战士）');
+res = await call('dnd_lookup', { kind: 'class', query: '战斗大师' });
+ok(!res.isError && res.content.includes('卓越骰'), '子职业（战斗大师）');
+res = await call('dnd_lookup', { kind: 'class', query: '牧师' });
+ok((res.content.match(/神域（/g) || []).length === 7, '牧师 7 个神域');
+
 console.log('— flow —');
 removeSave(ctx.chatKey); // 每次自检都从干净存档开始
-let res = await call('dnd_state');
+res = await call('dnd_state');
 ok(res.isError === true, '未开团时查状态给出引导');
 
 res = await call('dnd_new', { title: '自检团', level: 3 });
