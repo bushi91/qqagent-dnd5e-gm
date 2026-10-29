@@ -1,4 +1,5 @@
 import { abilityMod, profBonus, rollExpr, formatRoll } from './lib/dice.js';
+import { lookup, normalizeKind } from './lib/srd.js';
 import { load, save, update, remove, pushLog } from './lib/store.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -48,7 +49,192 @@ function findTarget(camp, ref) {
   if (pc) return { kind: 'pc', ref: pc, name: pc.name, hp: pc.hp, maxHp: pc.maxHp, ac: pc.ac };
   const foe = findFoe(camp, ref);
   if (foe) return { kind: 'foe', ref: foe, name: foe.name, hp: foe.hp, maxHp: foe.maxHp, ac: foe.ac };
+  const name = String(ref ?? '').trim();
+  if (name && camp.combat?.active) {
+    const entry = autoFoe(camp, name);
+    if (entry) return { kind: 'foe', ref: entry, name, hp: entry.hp, maxHp: entry.maxHp, ac: entry.ac };
+  }
   return null;
+}
+
+// ── v1.1 助手：地形网格 / 行动经济 ───────────────────────────────
+
+function hashStr(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function ensureGrid(camp) {
+  if (!camp.map) {
+    const w = 12;
+    const h = 9;
+    const cols = Array.from({ length: w }, () => Array.from({ length: h }, () => '.'));
+    let seed = hashStr(camp.chatKey + (camp.title || ''));
+    const pick = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed;
+    };
+    const pillars = 2 + (pick() % 3);
+    for (let i = 0; i < pillars; i++) {
+      const x = 2 + (pick() % (w - 4));
+      const y = 1 + (pick() % (h - 2));
+      cols[x][y] = '#';
+    }
+    camp.map = { w, h, cols };
+  }
+  return camp.map;
+}
+
+function gridCell(grid, x, y) {
+  const col = grid.cols[x];
+  return col ? col[y] || '#' : '#';
+}
+
+function dist(a, b) {
+  if (!a || !b) return null;
+  return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y));
+}
+
+function syncOrder(camp) {
+  const order = camp.combat?.order || [];
+  for (const e of order) {
+    if (e.kind === 'pc') {
+      const pc = findPc(camp, e.name);
+      if (pc) {
+        e.hp = pc.hp;
+        e.maxHp = pc.maxHp;
+        e.ac = pc.ac;
+        e.conditions = pc.conditions || [];
+      }
+    } else {
+      const foe = findFoe(camp, e.name);
+      if (foe) {
+        e.hp = foe.hp;
+        e.maxHp = foe.maxHp;
+        e.ac = foe.ac;
+      }
+    }
+  }
+}
+
+function findOrderEntry(camp, name) {
+  const n = String(name ?? '').trim();
+  if (!n) return null;
+  return (camp.combat?.order || []).find((e) => e.name === n) || null;
+}
+
+function autoFoe(camp, name) {
+  const n = String(name ?? '').trim().slice(0, 20);
+  if (!n) return null;
+  if (!Array.isArray(camp.enemies)) camp.enemies = [];
+  let foe = findFoe(camp, n);
+  if (!foe) {
+    foe = { name: n, hp: 13, maxHp: 13, ac: 13 };
+    camp.enemies.push(foe);
+  }
+  if (camp.combat?.active && !findOrderEntry(camp, n)) {
+    camp.combat.order.push({ key: `foe:${n}`, name: n, kind: 'foe', init: 5, hp: foe.hp, maxHp: foe.maxHp, ac: foe.ac });
+    camp.combat.order.sort((a, b) => b.init - a.init);
+    ensureGrid(camp);
+    placeTokens(camp, camp.combat.order);
+  }
+  return foe;
+}
+
+function placeTokens(camp, order) {
+  if (!camp.map) ensureGrid(camp);
+  const g = camp.map;
+  camp.combat.tokens = camp.combat.tokens || {};
+  const used = new Set(Object.values(camp.combat.tokens).map((t) => `${t.x},${t.y}`));
+  const free = (x, y) => x >= 0 && x < g.w && y >= 0 && y < g.h && gridCell(g, x, y) !== '#' && !used.has(`${x},${y}`);
+  let pcs = 0;
+  let foes = 0;
+  for (const e of order) {
+    if (camp.combat.tokens[e.key]) {
+      used.add(`${camp.combat.tokens[e.key].x},${camp.combat.tokens[e.key].y}`);
+      continue;
+    }
+    let spot = null;
+    const isPc = e.kind === 'pc';
+    const x0 = isPc ? 2 + (pcs % 4) : 8 - (foes % 3);
+    const y0 = isPc ? 6 + (pcs % 2) : 2 + (foes % 3);
+    for (let d = 0; d < 6 && !spot; d++) {
+      for (let dx = -d; dx <= d && !spot; dx++) {
+        for (let dy = -d; dy <= d && !spot; dy++) {
+          const x = x0 + dx;
+          const y = y0 + dy;
+          if (free(x, y)) spot = { x, y };
+        }
+      }
+    }
+    if (!spot) spot = { x: x0, y: y0 };
+    camp.combat.tokens[e.key] = { x: spot.x, y: spot.y };
+    used.add(`${spot.x},${spot.y}`);
+    if (isPc) pcs++;
+    else foes++;
+  }
+}
+
+function tokenOf(camp, key) {
+  return camp.combat?.tokens?.[key] || null;
+}
+
+function locationOf(camp, name) {
+  const e = findOrderEntry(camp, name);
+  return e ? tokenOf(camp, e.key) : null;
+}
+
+function renderGrid(camp, highlightKey) {
+  const g = ensureGrid(camp);
+  const order = camp.combat?.order || [];
+  const tokens = camp.combat?.tokens || {};
+  const byCell = {};
+  for (const e of order) {
+    const t = tokens[e.key];
+    if (t) byCell[`${t.x},${t.y}`] = e.name;
+  }
+  const lines = [];
+  for (let y = 0; y < g.h; y++) {
+    let line = '';
+    for (let x = 0; x < g.w; x++) {
+      const cell = gridCell(g, x, y);
+      const who = byCell[`${x},${y}`];
+      if (who) {
+        const e = order.find((i) => i.name === who);
+        line += e?.key === highlightKey ? '@' : String(who).slice(0, 1);
+      } else {
+        line += cell;
+      }
+    }
+    lines.push(line);
+  }
+  const legend = order
+    .map((e) => `${String(e.name).slice(0, 1)}=${e.name}${e.hp != null ? `(${e.hp}/${e.maxHp})` : ''}`)
+    .join(' ');
+  return `地图 ${g.w}x${g.h}（每格 5 尺，斜向算 1 格）：\n${lines.join('\n')}\n${legend}\n@=当前回合者`;
+}
+
+function currentEntry(camp) {
+  const c = camp.combat;
+  if (!c?.active || !c.order?.length) return null;
+  return c.order[c.index % c.order.length];
+}
+
+function turnOf(camp, entry) {
+  const round = camp.combat?.round ?? 1;
+  if (!entry.turn || entry.turn.round !== round) {
+    entry.turn = { round, action: true, bonus: true, reaction: true, move: 6 };
+  }
+  return entry.turn;
+}
+
+function costText(turn) {
+  if (!turn) return '资源未知';
+  return `动作${turn.action ? '可用' : '已用'} / 附赠${turn.bonus ? '可用' : '已用'} / 反应${turn.reaction ? '可用' : '已用'} / 移动剩 ${turn.move} 格`;
 }
 
 function mustCampaign(chatKey) {
@@ -90,6 +276,7 @@ function summary(camp) {
   const scene = camp.scene || {};
   const bits = [
     `《${camp.title}》第 ${camp.act || 1} 幕`,
+    camp.objective ? `目标：${camp.objective}` : '',
     scene.name ? `场景：${scene.name}` : '',
     scene.summary ? `回顾：${scene.summary}` : '',
     partyLines(camp),
@@ -470,6 +657,7 @@ export function setup(api) {
         const critText = args?.crit === true ? '（暴击）' : '';
         const text = `${target.name} 受到 ${amount} 点${typeText}伤害${critText}，剩 HP ${target.ref.hp}/${target.ref.maxHp}${note}`;
 
+        syncOrder(camp);
         pushLog(camp, { kind: 'damage', public: true, text });
         save(camp.chatKey, camp);
         const sent = await announce(ctx, `💥 ${text}`);
@@ -555,6 +743,8 @@ export function setup(api) {
             order.push({ key: `pc:${m.userId}`, name: m.name, kind: 'pc', init: rollInitiative(m), hp: m.hp, maxHp: m.maxHp, ac: m.ac });
           }
           order.push(...foes);
+          ensureGrid(camp);
+          placeTokens(camp, order);
           if (order.length === 0) return { content: '场上没有任何人，无法开始战斗', isError: true };
           order.sort((a, b) => b.init - a.init);
           camp.combat = { active: true, round: Math.max(1, clampInt(args?.round, 1, 99, 1)), index: 0, order };
@@ -634,6 +824,380 @@ export function setup(api) {
     }
   });
 
+  // ── v1.1 新增：攻击 / 移动 / 地图 / 行动经济 / 开局确认 / 目标 ────────
+  api.registerTool({
+    id: 'dnd_attack',
+    name: '攻击结算',
+    description:
+      '一次攻击的完整结算：掷攻击骰对 AC、掷伤害、扣血、检查射程与地形、扣动作。战斗中玩家的攻击、武技、法术命中都必须用它；不要用 dnd_roll 代替。',
+    category: 'utility',
+    icon: '⚔️',
+    parameters: {
+      type: 'object',
+      properties: {
+        actor: { type: 'string', description: '攻击者（角色名或敌人名），省略=当前回合者' },
+        target: { type: 'string', description: '目标名，未登记的敌人会自动加入战斗' },
+        bonus: { type: 'integer', description: '攻击加值，默认 5' },
+        damage: { type: 'string', description: '伤害骰，如 1d8+3；不给则只判命中' },
+        ranged: { type: 'boolean', description: '是否远程（近战 1 格 / 远程 12 格）' },
+        advantage: { type: 'string', description: 'normal / adv / dis' }
+      },
+      required: ['target']
+    },
+    async execute(ctx, args) {
+      try {
+        const { camp, error } = mustCampaign(ctx.chatKey);
+        if (error) return { content: error, isError: true };
+
+        const targetName = String(args?.target || '').trim();
+        if (!targetName) return { content: '缺少目标', isError: true };
+
+        if (!camp.combat?.active) {
+          const order = (camp.party || []).map((m) => ({
+            key: `pc:${m.userId}`,
+            name: m.name,
+            kind: 'pc',
+            init: rollInitiative(m),
+            hp: m.hp,
+            maxHp: m.maxHp,
+            ac: m.ac
+          }));
+          const foe = { key: `foe:${targetName}`, name: targetName, kind: 'foe', init: 5, hp: 12, maxHp: 12, ac: 13 };
+          order.push(foe);
+          order.sort((a, b) => b.init - a.init);
+          camp.combat = { active: true, round: 1, index: 0, order };
+        }
+
+        ensureGrid(camp);
+        placeTokens(camp, camp.combat.order);
+
+        const actorName = String(args?.actor || '').trim() || currentEntry(camp)?.name;
+        const actor = camp.combat.order.find((e) => e.name === actorName)
+          || camp.combat.order.find((e) => e.kind === 'pc' && e.name === actorName)
+          || currentEntry(camp);
+        if (!actor) return { content: '找不到攻击者，先 dnd_combat start', isError: true };
+
+        const target = findTarget(camp, targetName);
+        if (!target) return { content: `找不到目标「${targetName}」`, isError: true };
+
+        const aTok = tokenOf(camp, actor.key);
+        const tTok = tokenOf(camp, target.ref.key || `foe:${target.name}`);
+        const gap = dist(aTok, tTok);
+        const reach = args?.ranged === true ? 12 : 1;
+        if (gap != null && gap > reach) {
+          return {
+            content: `距离不够：${actor.name} 与 ${target.name} 相距 ${gap} 格，${args?.ranged === true ? '远程' : '近战'}射程 ${reach} 格。先 dnd_move 靠近，或换远程/法术。`,
+            isError: true
+          };
+        }
+
+        const turn = turnOf(camp, actor);
+        if (!turn.action) {
+          return { content: `${actor.name} 这回合的动作已经用掉了（${costText(turn)}）。要等下一位，或用附赠动作的轻武器攻击。`, isError: true };
+        }
+
+        const bonus = clampInt(args?.bonus, -10, 30, 5);
+        const r = rollExpr('1d20', args?.advantage);
+        if (r.error) return { content: r.error, isError: true };
+        const nat = r.kept?.[0] ?? 0;
+        const total = r.total + bonus;
+        const ac = target.ac ?? target.ref.ac ?? 13;
+        const crit = nat === 20;
+        const hit = crit || total >= ac;
+
+        turn.action = false;
+        let dmg = 0;
+        let dmgText = '';
+        if (hit && args?.damage) {
+          const dr = rollExpr(String(args.damage));
+          if (!dr.error) {
+            dmg = crit ? (dr.total ?? 0) + (dr.total ?? 0) : dr.total ?? 0;
+            target.ref.hp = Math.max(0, target.ref.hp - dmg);
+            if (target.kind === 'pc' && target.ref.hp === 0) {
+              target.ref.conditions = target.ref.conditions || [];
+              if (!target.ref.conditions.includes('倒地')) target.ref.conditions.push('倒地');
+            }
+            syncOrder(camp);
+            dmgText = `，${dmg} 点伤害${crit ? '（暴击）' : ''}，${target.name} 剩 ${target.ref.hp}/${target.ref.maxHp}`;
+          }
+        } else if (!hit) {
+          dmgText = '，未命中';
+        }
+
+        const text = `${actor.name} 攻击 ${target.name}：1d20(${nat}) ${bonus >= 0 ? '+' + bonus : bonus} = ${total} vs AC ${ac} → ${hit ? '命中' : '未命中'}${dmgText}${hit && !args?.damage ? '（未掷伤害）' : ''}`;
+        pushLog(camp, { kind: 'attack', public: true, text });
+        save(camp.chatKey, camp);
+        const sent = await announce(ctx, `⚔️ ${text}`);
+        return {
+          content: `${sent ? '已播报。' : ''}${text}。本回合剩余：${costText(turn)}。不要复述数字，直接叙述结果。`,
+          isError: false
+        };
+      } catch (error) {
+        return { content: `攻击结算失败：${error?.message ?? error}`, isError: true };
+      }
+    }
+  });
+
+  api.registerTool({
+    id: 'dnd_move',
+    name: '移动',
+    description: '在地图上移动角色/敌人（切比雪夫距离，每回合 6 格）。超出移动力或撞墙会拒绝。玩家说“我过去/我退到墙边”时使用。',
+    category: 'utility',
+    icon: '🥾',
+    parameters: {
+      type: 'object',
+      properties: {
+        actor: { type: 'string', description: '谁在移动，省略=当前回合者' },
+        x: { type: 'integer', description: '目标格 X（0~11）' },
+        y: { type: 'integer', description: '目标格 Y（0~8）' }
+      },
+      required: ['x', 'y']
+    },
+    async execute(ctx, args) {
+      try {
+        const { camp, error } = mustCampaign(ctx.chatKey);
+        if (error) return { content: error, isError: true };
+        const grid = ensureGrid(camp);
+        const actor = String(args?.actor || '').trim() || currentEntry(camp)?.name;
+        const entry = (camp.combat?.order || []).find((e) => e.name === actor);
+        if (!entry) return { content: `找不到「${actor}」，战斗开始后才有位置`, isError: true };
+        const t = grid.tokens[entry.key];
+        if (!t) return { content: '这名角色还没在地图上，先 dnd_combat start', isError: true };
+
+        const x = clampInt(args?.x, 0, grid.w - 1, t.x);
+        const y = clampInt(args?.y, 0, grid.h - 1, t.y);
+        if (gridCell(grid, x, y) === '#') return { content: `(${x},${y}) 是柱子/墙，站不上去`, isError: true };
+        const steps = dist(t, { x, y });
+        const turn = turnOf(camp, entry);
+        if (steps > turn.move) return { content: `移动力不够：需要 ${steps} 格，本回合只剩 ${turn.move} 格（每格 5 尺）`, isError: true };
+
+        turn.move -= steps;
+        t.x = x;
+        t.y = y;
+        pushLog(camp, { kind: 'move', public: false, text: `${entry.name} 移动到 (${x},${y})，走了 ${steps} 格` });
+        save(camp.chatKey, camp);
+        return {
+          content: `${entry.name} 移动到 (${x},${y})，消耗 ${steps} 格移动力，本回合剩余 ${turn.move} 格。\n${renderGrid(camp, entry.key)}`
+        };
+      } catch (error) {
+        return { content: `移动失败：${error?.message ?? error}`, isError: true };
+      }
+    }
+  });
+
+  api.registerTool({
+    id: 'dnd_map',
+    name: '看地图',
+    description: '显示当前战场的简易地形、每个人的位置、以及你与敌人的距离（格）。判断“够不够得到”“往哪走”时使用。',
+    category: 'query',
+    icon: '🗺️',
+    parameters: { type: 'object', properties: {} },
+    async execute(ctx) {
+      try {
+        const { camp, error } = mustCampaign(ctx.chatKey);
+        if (error) return { content: error, isError: true };
+        if (!camp.combat?.active) return { content: '现在没有战斗，没有战场地图。' };
+        ensureGrid(camp);
+        placeTokens(camp, camp.combat.order);
+        const cur = currentEntry(camp);
+        save(camp.chatKey, camp);
+        return {
+          content: `${renderGrid(camp, cur?.key)}\n现在是 ${cur?.name ?? '?'} 的回合（${cur?.turn ? costText(cur.turn) : '满资源'}），目标：${camp.objective || '（未设定，用 dnd_objective 设）'}`
+        };
+      } catch (error) {
+        return { content: `读取地图失败：${error?.message ?? error}`, isError: true };
+      }
+    }
+  });
+
+  api.registerTool({
+    id: 'dnd_action',
+    name: '行动消耗',
+    description:
+      '玩家做“攻击/施法”之外的举动时用它（开门、推人、喝药、躲藏、冲刺、协助、喊话、准备动作……）。工具判定消耗哪类资源并扣除，返回剩余；玩家做超出行动经济的第二件事时会被拒绝。',
+    category: 'utility',
+    icon: '🎯',
+    parameters: {
+      type: 'object',
+      properties: {
+        actor: { type: 'string', description: '行动者，省略=当前回合者' },
+        what: { type: 'string', description: '玩家要做的事，原话即可' },
+        kind: { type: 'string', description: '可选：action / bonus / reaction / move（不给就按描述推断）' }
+      },
+      required: ['what']
+    },
+    async execute(ctx, args) {
+      try {
+        const { camp, error } = mustCampaign(ctx.chatKey);
+        if (error) return { content: error, isError: true };
+        const actorName = String(args?.actor || '').trim() || currentEntry(camp)?.name;
+        const entry = (camp.combat?.order || []).find((e) => e.name === actorName);
+        const what = String(args?.what || '').trim().slice(0, 80);
+        if (!what) return { content: '缺少要做的事', isError: true };
+
+        if (!camp.combat?.active) {
+          pushLog(camp, { kind: 'action', public: false, text: `${actorName || '玩家'}：${what}（非战斗）` });
+          save(camp.chatKey, camp);
+          return { content: `非战斗场景，「${what}」不消耗行动经济，直接叙述即可。` };
+        }
+        if (!entry) return { content: `找不到「${actorName}」`, isError: true };
+
+        let kind = String(args?.kind || '').toLowerCase();
+        if (!['action', 'bonus', 'reaction', 'move'].includes(kind)) {
+          if (/附赠/.test(what)) kind = 'bonus';
+          else if (/借机|反应|护盾|倒伏|反制/.test(what)) kind = 'reaction';
+          else if (/冲刺|撤离|闪避|协助|躲藏|搜索|研究|准备|喝药|开门|推|擒抱|撞|喊话|威胁|交涉/.test(what)) kind = 'action';
+          else kind = 'action';
+        }
+
+        const turn = turnOf(camp, entry);
+        const label = { action: '动作', bonus: '附赠动作', reaction: '反应', move: '移动' }[kind];
+        if (!turn[kind]) {
+          return {
+            content: `${entry.name} 的${label}这回合已经用掉了（${costText(turn)}）。这件「${what}」不能算${label}——要么改到下回合，要么降级成不消耗资源的叙述。`,
+            isError: true
+          };
+        }
+        turn[kind] = false;
+        const text = `${entry.name}「${what}」消耗：${label}。本回合剩余：${costText(turn)}`;
+        pushLog(camp, { kind: 'action', public: false, text });
+        save(camp.chatKey, camp);
+        return { content: `${text}。请在回复里明确告诉玩家消耗了什么。` };
+      } catch (error) {
+        return { content: `行动结算失败：${error?.message ?? error}`, isError: true };
+      }
+    }
+  });
+
+  api.registerTool({
+    id: 'dnd_ready',
+    name: '角色卡确认',
+    description: '玩家确认自己的角色卡时调用（“就这样/确认/可以了”）。全员确认后才能 dnd_start 开场。',
+    category: 'utility',
+    icon: '✅',
+    parameters: {
+      type: 'object',
+      properties: { actor: { type: 'string', description: '确认的角色名' } },
+      required: ['actor']
+    },
+    async execute(ctx, args) {
+      try {
+        const { camp, error } = mustCampaign(ctx.chatKey);
+        if (error) return { content: error, isError: true };
+        const actor = String(args?.actor || '').trim();
+        const pc = findPc(camp, actor);
+        if (!pc) return { content: `队伍里没有「${actor}」，先 dnd_sheet 建卡`, isError: true };
+        camp.setup = camp.setup || { confirmed: [] };
+        if (!camp.setup.confirmed.includes(pc.userId)) camp.setup.confirmed.push(pc.userId);
+        save(camp.chatKey, camp);
+        const total = (camp.party || []).length;
+        const done = camp.setup.confirmed.length;
+        return {
+          content: `已记录 ${pc.name} 确认角色卡（${done}/${total}）。${done >= total ? '全员确认完毕，可以 dnd_start 开场。' : '还差：' + (camp.party || []).filter((m) => !camp.setup.confirmed.includes(m.userId)).map((m) => m.name).join('、')}`
+        };
+      } catch (error) {
+        return { content: `记录失败：${error?.message ?? error}`, isError: true };
+      }
+    }
+  });
+
+  api.registerTool({
+    id: 'dnd_start',
+    name: '开场',
+    description: '全员确认角色卡后开场：写入这一幕的目标并给出开场引导。没确认完会被拒绝。',
+    category: 'utility',
+    icon: '🎬',
+    parameters: {
+      type: 'object',
+      properties: {
+        objective: { type: 'string', description: '这一幕给玩家的明确目标，一句话' },
+        scene: { type: 'string', description: '开场场景名，可选' }
+      },
+      required: ['objective']
+    },
+    async execute(ctx, args) {
+      try {
+        const { camp, error } = mustCampaign(ctx.chatKey);
+        if (error) return { content: error, isError: true };
+        if (!(camp.party || []).length) return { content: '还没有角色卡，先让玩家建卡', isError: true };
+        const confirmed = camp.setup?.confirmed || [];
+        const missing = (camp.party || []).filter((m) => !confirmed.includes(m.userId));
+        if (missing.length) {
+          return {
+            content: `还不能开场：${missing.map((m) => m.name).join('、')} 还没确认角色卡。先让他们逐项核对并调 dnd_ready。`,
+            isError: true
+          };
+        }
+        const objective = String(args?.objective || '').trim().slice(0, 120);
+        if (!objective) return { content: '缺少目标', isError: true };
+        camp.objective = objective;
+        const scene = String(args?.scene || '').trim().slice(0, 30) || '开场';
+        camp.scene = { name: scene, summary: '' };
+        camp.act = camp.act || 1;
+        pushLog(camp, { kind: 'start', public: true, text: `开场：${scene}；目标：${objective}` });
+        save(camp.chatKey, camp);
+        return {
+          content: `已开场。目标：${objective}。现在用 3~5 条短句给出：地点、眼前发生了什么、玩家能做的 2~3 个方向。把目标原话说给玩家听。`
+        };
+      } catch (error) {
+        return { content: `开场失败：${error?.message ?? error}`, isError: true };
+      }
+    }
+  });
+
+  api.registerTool({
+    id: 'dnd_objective',
+    name: '剧情目标',
+    description: '设定或查看当前这一幕的目标。换场景、进新幕、玩家迷茫时必须更新并在群里重申。',
+    category: 'utility',
+    icon: '🎯',
+    parameters: {
+      type: 'object',
+      properties: { objective: { type: 'string', description: '新目标；不填则只查看' } }
+    },
+    async execute(ctx, args) {
+      try {
+        const { camp, error } = mustCampaign(ctx.chatKey);
+        if (error) return { content: error, isError: true };
+        const next = String(args?.objective || '').trim();
+        if (next) {
+          camp.objective = next.slice(0, 120);
+          pushLog(camp, { kind: 'objective', public: false, text: `目标更新：${camp.objective}` });
+          save(camp.chatKey, camp);
+        }
+        return { content: `当前目标：${camp.objective || '（未设定）'}。请在群里用一句话重申给玩家。` };
+      } catch (error) {
+        return { content: `目标读写失败：${error?.message ?? error}`, isError: true };
+      }
+    }
+  });
+
+  api.registerTool({
+    id: 'dnd_lookup',
+    name: '查表',
+    description:
+      '查 D&D 5e 种族、职业、技能、天赋的规则要点（属性加成、速度、特性、生命骰、主属性、豁免、职业 1~12 级特性路线、40 个子职业、技能对应属性、天赋前置与效果）。建卡前后玩家问“精灵有什么”“法师能用什么武器”“战士 3 级有啥能力”“5 级战士”“狂战士有什么”“战斗大师”时用；不带名字则列出全部清单。',
+    category: 'query',
+    icon: '📖',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', description: 'race / class / skill / feat，或直接写 种族/职业/技能/天赋' },
+        query: { type: 'string', description: '名字或关键词，如 精灵、法师、察觉、巨武器大师；也可写“战士 5 级”查某一级；省略则列清单' }
+      },
+      required: ['kind']
+    },
+    async execute(ctx, args) {
+      try {
+        const kind = normalizeKind(args?.kind);
+        const text = lookup(kind, args?.query);
+        return { content: text };
+      } catch (error) {
+        return { content: `查表失败：${error?.message ?? error}`, isError: true };
+      }
+    }
+  });
+
   // ── 日志 ─────────────────────────────────────────────────
   api.registerTool({
     id: 'dnd_log',
@@ -680,14 +1244,18 @@ export function promptSections(ctx) {
       : '未在战斗';
     const rules = [
       '【跑团主持规则】',
-      '1. 骰子、检定、伤害、先攻、HP 一律由工具计算，禁止自己编数字；要随机就调 dnd_roll / dnd_check。',
-      '2. 玩家说“我要……”→ 先判是否需要检定：有明显失败代价才掷骰，小事直接叙述。',
-      '3. 每次掷骰后不要复述骰子数字，用一句话叙述结果（“你一脚踹开，门后是……/差一点，刀锋擦着耳朵过去”）。',
-      '4. 输赢都有戏：失败推进剧情，不给死胡同；NPC 有目标与恐惧，不是任务发放机。',
-      '5. 每场战斗的 XP 按标准预算（5e DMG）：单人 1 级遇 3~4 只弱怪；每幕结束调 dnd_scene 写 200 字内摘要。',
-      '6. 血线 0 不是死，是倒地与死亡豁免；给玩家“还能赌一把”的选项。',
-      '7. 群里多人时：当前行动者才行动，其他人可以支招但不是行动；行动顺序靠 dnd_combat。'
+      '1. 一切随机与数值都走工具：dnd_roll / dnd_check / dnd_attack / dnd_damage / dnd_combat。禁止口算、编数字，也禁止用 dnd_roll 代替攻击结算。',
+      '2. 开局顺序：dnd_new → 每人 dnd_sheet 建卡 → 玩家逐项确认 dnd_ready → 全员确认后 dnd_start 定目标 → 再给第一个场景。没确认完不许开打。',
+      '3. 每一幕都要有明确目标（dnd_objective）。每次换场景、每 3 轮战斗、玩家不知道干嘛时，用一句话重申“你们现在的目标是……”。',
+      '4. 禁止卡关：同一个障碍最多两次检定；第二次失败必须换路（线索、代价、时间压力、新敌人），让局面向前走。玩家合理行动即使失败也要产生变化与情报，不许只回“再试试”。',
+      '5. 战斗：dnd_combat start 必须登记敌人；每次攻击调 dnd_attack（自动对 AC、扣血、播报）。没有工具结算就不许在叙述里说对方掉血。',
+      '6. 地形与距离：dnd_map 看位置，dnd_move 移动（每回合 6 格）。近战 1 格、远程 12 格；够不到必须直说“距离 X 格，够不着”，并要求移动或换手段。',
+      '7. 行动经济：攻击/施法之外的举动调 dnd_action，工具给出消耗与剩余。回复里必须说清“这次用了动作/附赠动作/反应/移动 X 格”；用完了就只能等下一轮。',
+      '8. 掷骰后不复述数字，改叙述结果；失败也要写出代价与推进。',
+      '9. 血线 0 是倒地不是死，给玩家“还能赌一把”的选择。',
+      '10. 群里多人时，只有当前行动者能行动，其他人是支招；顺序由 dnd_combat 管理。'
     ].join('\n');
+
     const body = [
       rules,
       '',
